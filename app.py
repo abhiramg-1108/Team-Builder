@@ -1,29 +1,133 @@
 import streamlit as st
 import plotly.graph_objects as go
 import networkx as nx
+import sqlite3
+import json
 import math
+import csv
+import io
 
-# =========================================
-# 1. CORE DSA ENGINE (Graphs, Hash Maps, Arrays)
+# ==========================================
+# 1. PERSISTENT SQLITE DATABASE (ROSTER LOCK)
+# ==========================================
+DB_FILE = "class_roster.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # registered: 0 = Pending (Uploaded by Prof), 1 = Claimed & Submitted by Student
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            sid TEXT PRIMARY KEY,
+            name TEXT,
+            skills TEXT,
+            interests TEXT,
+            availability TEXT,
+            registered INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS edges (
+            u TEXT,
+            v TEXT,
+            weight INTEGER,
+            PRIMARY KEY (u, v)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def clear_entire_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM students")
+    c.execute("DELETE FROM edges")
+    conn.commit()
+    conn.close()
+
+def import_master_roster(roster_rows):
+    """Professor uploads (sid, name) list. Resets database to this fresh class roster."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM students")
+    c.execute("DELETE FROM edges")
+    for sid, name in roster_rows:
+        c.execute(
+            "INSERT OR REPLACE INTO students (sid, name, skills, interests, availability, registered) VALUES (?, ?, ?, ?, ?, 0)",
+            (sid, name, json.dumps([]), json.dumps([]), json.dumps([]))
+        )
+    conn.commit()
+    conn.close()
+
+def register_student_submission(sid, skills, interests, avail, friend_id="None", avoid_id="None"):
+    """Locks the student's profile (registered = 1) so no one else can select them."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """UPDATE students 
+           SET skills = ?, interests = ?, availability = ?, registered = 1 
+           WHERE sid = ? AND registered = 0""",
+        (json.dumps(skills), json.dumps(interests), json.dumps(avail), sid)
+    )
+    if friend_id != "None" and friend_id != sid:
+        c.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, 1)", (sid, friend_id))
+    if avoid_id != "None" and avoid_id != sid:
+        c.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, -1)", (sid, avoid_id))
+    conn.commit()
+    conn.close()
+
+def unlock_student_registration(sid):
+    """Allows the professor to reset a single student's submission if they made a mistake."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE students SET skills = '[]', interests = '[]', availability = '[]', registered = 0 WHERE sid = ?",
+        (sid,)
+    )
+    c.execute("DELETE FROM edges WHERE u = ?", (sid,))
+    conn.commit()
+    conn.close()
+
+def fetch_roster_status():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT sid, name, skills, interests, availability, registered FROM students ORDER BY sid")
+    rows = c.fetchall()
+    
+    unregistered = []
+    registered = []
+    all_students_map = {}
+    
+    for r in rows:
+        sid, name, skills, interests, avail, reg = r[0], r[1], json.loads(r[2]), json.loads(r[3]), json.loads(r[4]), r[5]
+        all_students_map[sid] = name
+        if reg == 1:
+            registered.append((sid, name, skills, interests, avail))
+        else:
+            unregistered.append((sid, name))
+            
+    c.execute("SELECT u, v, weight FROM edges")
+    edges = [(r[0], r[1], r[2]) for r in c.fetchall()]
+    conn.close()
+    return unregistered, registered, edges, all_students_map
+
+
+# ==========================================
+# 2. CORE DSA ENGINE (Graphs, Hash Maps, Arrays)
 # ==========================================
 class TeamBuilder:
-    def __init__(self, required_skills, team_size, skill_weight=50, friend_weight=30, schedule_weight=20):
-        # ARRAY: List of required project skills
+    def __init__(self, required_skills, team_size, skill_weight=60, friend_weight=35, schedule_weight=20):
         self.required_skills = required_skills
         self.team_size = team_size
-        
-        # Normalized 0-100 weights scaled cleanly for scoring
         self.skill_weight = skill_weight
         self.friend_weight = friend_weight
         self.schedule_weight = schedule_weight
         
         # HASH MAP: student_id -> student profile dict
         self.students = {}
-        
         # GRAPH (Adjacency List): student_id -> {other_student_id: +1 or -1}
         self.preference_graph = {}
-        
-        # ARRAY: Execution logs for DSA demonstration
+        # ARRAY: Step-by-step execution logs
         self.logs = []
 
     def log(self, message):
@@ -32,9 +136,9 @@ class TeamBuilder:
     def add_student(self, student_id, name, skills, interests, availability):
         self.students[student_id] = {
             "name": name,
-            "skills": skills,               # Array
-            "interests": interests,         # Array
-            "availability": availability    # Array
+            "skills": skills,
+            "interests": interests,
+            "availability": availability
         }
         if student_id not in self.preference_graph:
             self.preference_graph[student_id] = {}
@@ -56,11 +160,9 @@ class TeamBuilder:
     def calculate_fit_score(self, candidate_id, current_team):
         candidate = self.students[candidate_id]
         
-        # Round 1 (Empty Team): Pick strong anchor students first
         if not current_team:
             useful_skills = [s for s in candidate["skills"] if s in self.required_skills]
             has_friends = any(w == 1 for w in self.preference_graph.get(candidate_id, {}).values())
-            # Slight holdback if they have a friend so they stay free to pair up in Round 2
             friend_holdback = -(self.friend_weight * 0.15) if has_friends else 0
             return (len(useful_skills) * self.skill_weight) + friend_holdback
 
@@ -73,7 +175,7 @@ class TeamBuilder:
 
         score = 0
 
-        # 1. Graph Preferences (+1 Friend / -1 Conflict)
+        # 1. Graph Preferences (+1 / -1)
         for member_id in current_team:
             edge_a_to_b = self.preference_graph.get(candidate_id, {}).get(member_id, 0)
             edge_b_to_a = self.preference_graph.get(member_id, {}).get(candidate_id, 0)
@@ -85,10 +187,9 @@ class TeamBuilder:
                 if skill not in team_skills:
                     score += self.skill_weight
                 else:
-                    # Overlap penalty scales with skill_weight so redundant skills stay separated
                     score -= (self.skill_weight * 0.35)
 
-        # 3. Schedule & Interest Match (FIXED BUG: now properly checks member["interests"])
+        # 3. Schedule & Interest Match
         for member_id in current_team:
             member = self.students[member_id]
             shared_time = set(candidate["availability"]).intersection(member["availability"])
@@ -132,7 +233,6 @@ class TeamBuilder:
         teams = [[] for _ in range(num_teams)]
 
         round_num = 1
-        # Keep drafting round-by-round until ALL students are assigned
         while unassigned:
             self.log(f"--- Draft Round {round_num} ---")
             for team_idx, team in enumerate(teams):
@@ -161,27 +261,20 @@ class TeamBuilder:
 
 
 # ==========================================
-# 2. ENHANCED VISUALIZATIONS
+# 3. VISUALIZATIONS
 # ==========================================
 PALETTE = ["#6366F1", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6"]
 
 def plot_network_graph(builder, teams):
     G = nx.Graph()
-    node_color_map = {}
-    node_team_map = {}
-
-    # Position nodes in circular clusters per team so visual grouping is crystal clear
     pos = {}
     num_teams = max(1, len(teams))
+    
     for t_idx, team in enumerate(teams):
         angle_center = 2 * math.pi * t_idx / num_teams
         cx, cy = 2.2 * math.cos(angle_center), 2.2 * math.sin(angle_center)
-        
         for m_idx, sid in enumerate(team):
             G.add_node(sid)
-            node_color_map[sid] = PALETTE[t_idx % len(PALETTE)]
-            node_team_map[sid] = f"Team {t_idx + 1}"
-            
             sub_angle = 2 * math.pi * m_idx / max(1, len(team))
             pos[sid] = (cx + 0.75 * math.cos(sub_angle), cy + 0.75 * math.sin(sub_angle))
 
@@ -209,7 +302,6 @@ def plot_network_graph(builder, teams):
             )
         )
 
-    # Create legend traces per team so colors are clearly labeled
     team_traces = []
     for t_idx, team in enumerate(teams):
         if not team:
@@ -237,17 +329,16 @@ def plot_network_graph(builder, teams):
 
     fig = go.Figure(data=edge_traces + team_traces)
     fig.update_layout(
-        title="<b>Interactive Student Graph & Team Clusters</b> <span style='font-size:12px;color:gray'>(Solid Green = +1 Preferred Partner | Dotted Red = -1 Conflict)</span>",
+        title="<b>Registered Student Preference Graph & Formed Clusters</b> <span style='font-size:12px;color:gray'>(Solid Green = +1 Partner | Dotted Red = -1 Conflict)</span>",
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-3.8, 3.8]),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-3.8, 3.8]),
-        height=430,
+        height=420,
         margin=dict(l=20, r=20, t=50, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)"
     )
     return fig
-
 
 def plot_radar_chart(team_name, skill_counts, required_skills, color):
     values = [skill_counts.get(skill, 0) for skill in required_skills]
@@ -280,11 +371,11 @@ def plot_radar_chart(team_name, skill_counts, required_skills, color):
 
 
 # ==========================================
-# 3. STREAMLIT UI & STATE MANAGEMENT
+# 4. STREAMLIT UI (ROSTER -> CLAIM -> EXPORT)
 # ==========================================
-st.set_page_config(page_title="DSA Smart Team Builder", layout="wide")
+st.set_page_config(page_title="Dynamic Smart Team Builder", layout="wide")
+init_db()
 
-# Custom CSS for sleek cards & badges
 st.markdown("""
 <style>
 .team-card {
@@ -308,189 +399,266 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎯 Smart Project Team Formation Engine")
-st.caption("DSA Architecture: **Adjacency List Graph** (Preferences & Conflicts) • **Hash Map** (`O(1)` Student Lookups) • **Arrays** (Round-Robin Greedy Draft & Conflict Swap)")
+st.title("🎯 Classroom Team Formation System")
+st.caption("Workflow: **1. Professor Imports Master Roll-Call CSV** $\\rightarrow$ **2. Students Claim Their Roll No Once & Submit Skills** $\\rightarrow$ **3. Engine Builds Teams & Exports CSV**")
 
-# --- Initialize Presets in Session State ---
-DEFAULT_6_STUDENTS = [
-    ("S1", "Aarav",  ["Frontend", "UI/UX"],   ["Web", "EdTech"],   ["Mon", "Wed"]),
-    ("S2", "Bhavya", ["Backend", "Database"], ["Web", "FinTech"],  ["Mon", "Fri"]),
-    ("S3", "Charan", ["AI/ML"],               ["EdTech", "Health"],["Mon", "Wed"]),
-    ("S4", "Diya",   ["Frontend", "Backend"], ["Health", "AI"],    ["Tue", "Thu"]),
-    ("S5", "Eshan",  ["AI/ML", "Database"],   ["Health", "Web"],   ["Tue", "Thu"]),
-    ("S6", "Farah",  ["Frontend"],            ["Web", "EdTech"],   ["Tue", "Thu"]),
-]
-DEFAULT_6_EDGES = [
-    ("S1", "S6", 1), ("S6", "S1", 1),
-    ("S1", "S3", 1), ("S3", "S1", 1),
-    ("S6", "S5", -1), ("S6", "S4", -1)
-]
+unregistered_list, registered_list, edges_data, all_students_map = fetch_roster_status()
+total_roster_count = len(unregistered_list) + len(registered_list)
 
-PRESET_12_STUDENTS = DEFAULT_6_STUDENTS + [
-    ("S7", "Gaurav", ["Backend", "AI/ML"],    ["FinTech", "AI"],   ["Mon", "Wed"]),
-    ("S8", "Hima",   ["Frontend", "Database"],["Web", "Health"],   ["Tue", "Fri"]),
-    ("S9", "Ishaan", ["AI/ML", "UI/UX"],      ["EdTech", "AI"],    ["Mon", "Thu"]),
-    ("S10", "Jiya",  ["Backend"],             ["Web", "FinTech"],  ["Wed", "Fri"]),
-    ("S11", "Kiran", ["Database", "Frontend"],["Health", "EdTech"],["Tue", "Thu"]),
-    ("S12", "Laksh", ["AI/ML", "Backend"],    ["AI", "Web"],       ["Mon", "Fri"]),
-]
-PRESET_12_EDGES = DEFAULT_6_EDGES + [
-    ("S7", "S8", 1), ("S8", "S7", 1),
-    ("S9", "S12", -1), ("S10", "S11", 1)
-]
+ALL_SKILLS = ["Frontend", "Backend", "AI/ML", "Database", "UI/UX"]
+ALL_INTERESTS = ["Web", "AI", "EdTech", "FinTech", "Health"]
+ALL_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 
-if "students_list" not in st.session_state:
-    st.session_state.students_list = list(DEFAULT_6_STUDENTS)
-if "edges_list" not in st.session_state:
-    st.session_state.edges_list = list(DEFAULT_6_EDGES)
+# ==========================================
+# SIDEBAR: PROFESSOR ROSTER UPLOAD & WEIGHTS
+# ==========================================
+st.sidebar.header("📂 Step 1: Master Class Roster")
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("🎛️ Class Dataset Preset")
-col_p1, col_p2 = st.sidebar.columns(2)
-if col_p1.button("6 Students (Demo)", use_container_width=True):
-    st.session_state.students_list = list(DEFAULT_6_STUDENTS)
-    st.session_state.edges_list = list(DEFAULT_6_EDGES)
-    st.rerun()
-if col_p2.button("12 Students (Large)", use_container_width=True):
-    st.session_state.students_list = list(PRESET_12_STUDENTS)
-    st.session_state.edges_list = list(PRESET_12_EDGES)
-    st.rerun()
+# Provide a downloadable sample CSV so testing takes 5 seconds
+sample_roster_csv = "roll_no,name\nS101,Aarav Sharma\nS102,Bhavya Nair\nS103,Charan Reddy\nS104,Diya Patel\nS105,Eshan Verma\nS106,Farah Khan\n"
+st.sidebar.download_button(
+    "⬇️ Download Sample Roll-Call CSV",
+    data=sample_roster_csv,
+    file_name="sample_class_roster.csv",
+    mime="text/csv",
+    use_container_width=True
+)
+
+uploaded_roster = st.sidebar.file_uploader("Upload Class Roll-Call CSV (`roll_no, name`)", type=["csv"])
+if uploaded_roster is not None:
+    if st.sidebar.button("📥 Initialize Class Roster from CSV", type="primary", use_container_width=True):
+        content = io.StringIO(uploaded_roster.getvalue().decode("utf-8-sig"))
+        reader = csv.DictReader(content)
+        roster_rows = []
+        for row in reader:
+            # Support flexible column headers (roll_no / sid / id and name / student_name)
+            normalized = {k.strip().lower(): v.strip() for k, v in row.items() if k and v}
+            sid = normalized.get("roll_no") or normalized.get("sid") or normalized.get("id")
+            name = normalized.get("name") or normalized.get("student_name")
+            if sid and name:
+                roster_rows.append((sid, name))
+        if roster_rows:
+            import_master_roster(roster_rows)
+            st.sidebar.success(f"Loaded {len(roster_rows)} students! Ready for registration.")
+            st.rerun()
+        else:
+            st.sidebar.error("Could not find `roll_no` and `name` columns in CSV.")
+
+if total_roster_count > 0:
+    if st.sidebar.button("🗑️ Wipe Entire Database", use_container_width=True):
+        clear_entire_db()
+        st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Algorithm Weights (0–100)")
+st.sidebar.header("⚙️ Step 3: Algorithm Weights")
 team_sz = st.sidebar.slider("Target Team Size", 2, 5, 3)
-skill_w = st.sidebar.slider("Skill Coverage Priority", 0, 100, 60, step=5, help="Higher = Prioritizes filling missing team skills.")
-friend_w = st.sidebar.slider("Friendship Preference (+1 Edge)", 0, 100, 35, step=5, help="Drag to 90+ and lower Skill Priority to see friends group up despite overlapping skills!")
+skill_w = st.sidebar.slider("Skill Coverage Priority", 0, 100, 60, step=5)
+friend_w = st.sidebar.slider("Friendship Preference (+1 Edge)", 0, 100, 35, step=5)
 sched_w = st.sidebar.slider("Schedule & Interest Match", 0, 100, 20, step=5)
 
-# --- Add Any Student ---
-with st.sidebar.expander("➕ Add New Student Node"):
-    with st.form("add_student_form"):
-        next_id = f"S{len(st.session_state.students_list)+1}"
-        new_name = st.text_input("Student Name", "Navya")
-        new_skills = st.multiselect("Skills", ["Frontend", "Backend", "AI/ML", "Database", "UI/UX"], default=["Backend", "Database"])
-        new_interests = st.multiselect("Interests", ["Web", "AI", "EdTech", "FinTech", "Health"], default=["AI", "Web"])
-        new_avail = st.multiselect("Free Days", ["Mon", "Tue", "Wed", "Thu", "Fri"], default=["Mon", "Wed"])
-        if st.form_submit_button("Add to Hash Map") and new_name:
-            st.session_state.students_list.append((next_id, new_name, new_skills, new_interests, new_avail))
+# Allow Professor to unlock a student if someone accidentally submitted wrong info
+if registered_list:
+    with st.sidebar.expander("🔓 Admin: Reset a Student's Lock"):
+        reg_ids = [sid for sid, _, _, _, _ in registered_list]
+        reset_sid = st.selectbox("Select Registered Student", reg_ids, format_func=lambda x: f"{all_students_map[x]} ({x})")
+        if st.button("Unlock Student for Re-submission", use_container_width=True):
+            unlock_student_registration(reset_sid)
             st.rerun()
 
-# --- Add Graph Edge Between ANY Two Students ---
-with st.sidebar.expander("🕸️ Add Friend / Conflict Graph Edge"):
-    student_label_map = {sid: f"{name} ({sid})" for sid, name, _, _, _ in st.session_state.students_list}
-    s_ids = list(student_label_map.keys())
-    with st.form("add_edge_form"):
-        u_node = st.selectbox("From Student", s_ids, format_func=lambda x: student_label_map[x])
-        v_node = st.selectbox("To Student", s_ids, index=min(1, len(s_ids)-1), format_func=lambda x: student_label_map[x])
-        edge_type = st.radio("Relationship Type", [1, -1], format_func=lambda w: "💚 Preferred Partner (+1)" if w == 1 else "🚫 Conflict / Avoid (-1)")
-        both_ways = st.checkbox("Make Mutual (Bidirectional Edge)", value=True)
-        if st.form_submit_button("Add Graph Edge") and u_node != v_node:
-            st.session_state.edges_list = [(u, v, w) for u, v, w in st.session_state.edges_list if not (u == u_node and v == v_node)]
-            st.session_state.edges_list.append((u_node, v_node, edge_type))
-            if both_ways:
-                st.session_state.edges_list = [(u, v, w) for u, v, w in st.session_state.edges_list if not (u == v_node and v == u_node)]
-                st.session_state.edges_list.append((v_node, u_node, edge_type))
-            st.rerun()
 
-# --- Run the Engine ---
-required_skills = ["Frontend", "Backend", "AI/ML", "Database"]
-builder = TeamBuilder(required_skills, team_size=team_sz, skill_weight=skill_w, friend_weight=friend_w, schedule_weight=sched_w)
+# ==========================================
+# MAIN TABS: STUDENT PORTAL vs PROFESSOR VIEW
+# ==========================================
+tab_student, tab_prof = st.tabs([
+    f"🎓 Step 2: Student Registration Portal ({len(unregistered_list)} Pending)",
+    f"👨‍🏫 Step 3: Professor Dashboard & Team Builder ({len(registered_list)}/{total_roster_count} Ready)"
+])
 
-for sid, name, skills, interests, avail in st.session_state.students_list:
-    builder.add_student(sid, name, skills, interests, avail)
-
-for u, v, w in st.session_state.edges_list:
-    builder.add_preference(u, v, w)
-
-teams = builder.form_teams()
-
-# --- Manual Swap Simulator ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔄 Live Swap Simulator")
-all_sids = list(builder.students.keys())
-swap_a = st.sidebar.selectbox("Swap Student A", ["None"] + all_sids, format_func=lambda x: f"{builder.students[x]['name']} ({x})" if x != "None" else "None")
-swap_b = st.sidebar.selectbox("With Student B", ["None"] + all_sids, format_func=lambda x: f"{builder.students[x]['name']} ({x})" if x != "None" else "None")
-
-if swap_a != "None" and swap_b != "None" and swap_a != swap_b:
-    for team in teams:
-        if swap_a in team and swap_b not in team:
-            team[team.index(swap_a)] = swap_b
-        elif swap_b in team and swap_a not in team:
-            team[team.index(swap_b)] = swap_a
-    st.sidebar.info(f"Swapped {builder.students[swap_a]['name']} ↔ {builder.students[swap_b]['name']}")
-
-# --- Calculate Top Summary Metrics ---
-coverage_scores = []
-total_conflicts = 0
-for team in teams:
-    t_skills = {s for sid in team for s in builder.students[sid]["skills"] if s in required_skills}
-    coverage_scores.append((len(t_skills) / len(required_skills)) * 100)
-    if any(builder.has_conflict(sid, team) for sid in team):
-        total_conflicts += 1
-
-avg_coverage = sum(coverage_scores) / max(1, len(coverage_scores))
-fairness = max(0.0, 100.0 - (max(coverage_scores) - min(coverage_scores))) if coverage_scores else 100.0
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("👥 Total Students / Teams", f"{len(builder.students)} Students → {len(teams)} Teams")
-k2.metric("📊 Avg Skill Coverage", f"{avg_coverage:.1f}%")
-k3.metric("⚖️ Fairness Score", f"{fairness:.1f} / 100")
-k4.metric("🛡️ Conflict Status", "0 Conflicts" if total_conflicts == 0 else f"{total_conflicts} Conflict(s)!", delta="Optimal" if total_conflicts == 0 else "Action Needed", delta_color="normal" if total_conflicts == 0 else "inverse")
-
-# --- Network Graph ---
-st.plotly_chart(plot_network_graph(builder, teams), use_container_width=True)
-
-# --- 2-Column Responsive Team Cards ---
-st.subheader("📋 Generated Teams & Skill Balance")
-for row_start in range(0, len(teams), 2):
-    row_cols = st.columns(2)
-    for col_offset in range(2):
-        t_idx = row_start + col_offset
-        if t_idx >= len(teams):
-            break
-        team = teams[t_idx]
-        t_color = PALETTE[t_idx % len(PALETTE)]
+# ------------------------------------------
+# TAB 1: STUDENT SELF-REGISTRATION PORTAL
+# ------------------------------------------
+with tab_student:
+    st.subheader("🎓 One-Time Student Skill & Schedule Submission")
+    
+    if total_roster_count == 0:
+        st.info("👈 **Waiting for Professor:** No class roster has been uploaded yet. Please upload a Roll-Call CSV in the left sidebar (`Step 1`) to begin.")
+    elif len(unregistered_list) == 0:
+        st.success("🎉 **100% of the class has registered!** All student profiles are locked in. Switch to the **Professor Dashboard** tab to view and export the teams.")
+    else:
+        st.write("Select your **Roll Number & Name** from the official class roster below. **Note:** Once you submit, your name will be locked and removed from this list so no one else can submit under your name.")
         
-        with row_cols[col_offset]:
-            skill_counts = {}
-            for sid in team:
-                for s in builder.students[sid]["skills"]:
-                    skill_counts[s] = skill_counts.get(s, 0) + 1
+        unreg_ids = [sid for sid, _ in unregistered_list]
+        all_roster_ids = list(all_students_map.keys())
 
-            missing = [s for s in required_skills if s not in skill_counts]
-            overlaps = [s for s, c in skill_counts.items() if c > 1]
-            cov_pct = ((len(required_skills) - len(missing)) / len(required_skills)) * 100
-            has_conf = any(builder.has_conflict(sid, team) for sid in team)
+        with st.form("locked_student_form", clear_on_submit=True):
+            selected_sid = st.selectbox(
+                "🔒 Select Your Name & Roll Number (Unregistered Students Only) *",
+                unreg_ids,
+                format_func=lambda x: f"{x} — {all_students_map[x]}"
+            )
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                stu_skills = st.multiselect("Your Technical Skills *", ALL_SKILLS, default=["Frontend"])
+                stu_interests = st.multiselect("Project Domain Interests *", ALL_INTERESTS, default=["Web"])
+            with c2:
+                stu_avail = st.multiselect("Your Available Days for Team Meetings *", ALL_DAYS, default=["Mon", "Wed"])
 
-            member_badges = ""
-            for sid in team:
-                s_obj = builder.students[sid]
-                skills_str = ", ".join(s_obj["skills"])
-                member_badges += f"<div style='margin:4px 0;'>• <b>{s_obj['name']}</b> (<code>{sid}</code>) — <span class='skill-badge'>{skills_str}</span></div>"
+            st.markdown("#### 🤝 Optional: Partner Preferences (From Class Roster)")
+            p1, p2 = st.columns(2)
+            with p1:
+                pref_friend = st.selectbox(
+                    "💚 Preferred Teammate (+1 Graph Edge)",
+                    ["None"] + all_roster_ids,
+                    format_func=lambda x: f"{x} — {all_students_map[x]}" if x != "None" else "None (No Preference)"
+                )
+            with p2:
+                pref_avoid = st.selectbox(
+                    "🚫 Conflict / Prefer Not to Work With (-1 Graph Edge)",
+                    ["None"] + all_roster_ids,
+                    format_func=lambda x: f"{x} — {all_students_map[x]}" if x != "None" else "None (No Conflict)"
+                )
 
-            st.markdown(f"""
-            <div class="team-card" style="border-left: 6px solid {t_color};">
-                <h4 style="margin:0 0 8px 0;">Team {t_idx + 1} <span style="float:right;font-size:14px;color:{t_color};">{cov_pct:.0f}% Coverage</span></h4>
-                {member_badges}
-            </div>
-            """, unsafe_allow_html=True)
+            submit_btn = st.form_submit_button("✅ Lock & Submit My Profile", type="primary", use_container_width=True)
+            if submit_btn:
+                if not stu_skills or not stu_avail:
+                    st.error("Please select at least one **Technical Skill** and at least one **Available Day**.")
+                elif pref_friend != "None" and pref_friend == pref_avoid:
+                    st.error("You cannot select the same classmate as both a Preferred Partner and a Conflict!")
+                else:
+                    register_student_submission(selected_sid, stu_skills, stu_interests, stu_avail, pref_friend, pref_avoid)
+                    st.success(f"🔒 Profile locked for **{all_students_map[selected_sid]} ({selected_sid})**!")
+                    st.rerun()
 
-            if has_conf:
-                st.error("⚠️ Conflict Alert: Team contains members with a -1 Graph edge!")
-            elif not missing:
-                st.success("✅ All 4 Core Skills Covered & Conflict-Free")
-            else:
-                st.warning(f"⚠️ Missing Skills: {', '.join(missing)}")
 
-            st.caption(f"**Overlapping Skills:** {', '.join(overlaps) if overlaps else 'None'}")
-            st.plotly_chart(plot_radar_chart(f"Team {t_idx+1}", skill_counts, required_skills, t_color), use_container_width=True)
+# ------------------------------------------
+# TAB 2: PROFESSOR DASHBOARD & TEAM BUILDER
+# ------------------------------------------
+with tab_prof:
+    if total_roster_count == 0:
+        st.info("👈 Upload a **Class Roll-Call CSV** (`roll_no, name`) in the left sidebar to initialize your class.")
+    else:
+        # Registration Progress Bar & Roster Status Expander
+        reg_ratio = len(registered_list) / total_roster_count
+        st.progress(reg_ratio, text=f"📋 Class Registration Progress: {len(registered_list)} of {total_roster_count} Students Submitted ({reg_ratio*100:.0f}%)")
+        
+        with st.expander("👀 View Registered vs. Pending Students"):
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                st.markdown(f"**✅ Registered & Locked ({len(registered_list)})**")
+                for sid, name, skills, _, avail in registered_list:
+                    st.caption(f"• `{sid}` **{name}** — Skills: {', '.join(skills)} | Days: {', '.join(avail)}")
+            with rc2:
+                st.markdown(f"**⏳ Pending Submission ({len(unregistered_list)})**")
+                for sid, name in unregistered_list:
+                    st.caption(f"• `{sid}` {name}")
 
-# --- DSA Inspector at Bottom ---
-with st.expander("🔍 Inspect Underlying Data Structures & Execution Logs (DSA Viva Panel)"):
-    tab1, tab2, tab3 = st.tabs(["📜 Draft & Swap Logs (Array)", "🕸️ Adjacency List (Graph)", "🗂️ Student Profiles (Hash Map)"])
-    with tab1:
-        st.code("\n".join(builder.logs), language="text")
-    with tab2:
-        st.json(builder.preference_graph)
-    with tab3:
-        st.json(builder.students)
+        if len(registered_list) < 2:
+            st.warning("⏳ Waiting for at least **2 students** to complete their registration in Step 2 before teams can be formed.")
+        else:
+            required_skills = ["Frontend", "Backend", "AI/ML", "Database"]
+            builder = TeamBuilder(required_skills, team_size=team_sz, skill_weight=skill_w, friend_weight=friend_w, schedule_weight=sched_w)
+
+            for sid, name, skills, interests, avail in registered_list:
+                builder.add_student(sid, name, skills, interests, avail)
+            for u, v, w in edges_data:
+                builder.add_preference(u, v, w)
+
+            teams = builder.form_teams()
+
+            # Top Metrics + CSV Export Button
+            coverage_scores = []
+            total_conflicts = 0
+            for team in teams:
+                t_skills = {s for sid in team for s in builder.students[sid]["skills"] if s in required_skills}
+                coverage_scores.append((len(t_skills) / len(required_skills)) * 100)
+                if any(builder.has_conflict(sid, team) for sid in team):
+                    total_conflicts += 1
+
+            avg_coverage = sum(coverage_scores) / max(1, len(coverage_scores))
+            fairness = max(0.0, 100.0 - (max(coverage_scores) - min(coverage_scores))) if coverage_scores else 100.0
+
+            k1, k2, k3, k4, k5 = st.columns([1.2, 1, 1, 1, 1.1])
+            k1.metric("👥 Active Roster → Teams", f"{len(builder.students)} Students → {len(teams)} Teams")
+            k2.metric("📊 Avg Skill Coverage", f"{avg_coverage:.1f}%")
+            k3.metric("⚖️ Fairness Score", f"{fairness:.1f} / 100")
+            k4.metric("🛡️ Conflict Status", "0 Conflicts" if total_conflicts == 0 else f"{total_conflicts} Conflict(s)!", delta="Optimal" if total_conflicts == 0 else "Action Needed", delta_color="normal" if total_conflicts == 0 else "inverse")
+
+            # Generate Export CSV of Final Teams
+            export_buffer = io.StringIO()
+            writer = csv.writer(export_buffer)
+            writer.writerow(["Team_Number", "Roll_No", "Student_Name", "Skills", "Interests", "Available_Days"])
+            for idx, team in enumerate(teams, 1):
+                for sid in team:
+                    s = builder.students[sid]
+                    writer.writerow([f"Team {idx}", sid, s["name"], ";".join(s["skills"]), ";".join(s["interests"]), ";".join(s["availability"])])
+            
+            with k5:
+                st.write("")
+                st.download_button(
+                    label="📥 Export Final Teams CSV",
+                    data=export_buffer.getvalue(),
+                    file_name="final_formed_teams.csv",
+                    mime="text/csv",
+                    type="primary",
+                    use_container_width=True
+                )
+
+            # Interactive Network Graph
+            st.plotly_chart(plot_network_graph(builder, teams), use_container_width=True)
+
+            # 2-Column Team Breakdown Cards
+            st.subheader("📋 Generated Teams & Skill Balance")
+            for row_start in range(0, len(teams), 2):
+                row_cols = st.columns(2)
+                for col_offset in range(2):
+                    t_idx = row_start + col_offset
+                    if t_idx >= len(teams):
+                        break
+                    team = teams[t_idx]
+                    t_color = PALETTE[t_idx % len(PALETTE)]
+                    
+                    with row_cols[col_offset]:
+                        skill_counts = {}
+                        for sid in team:
+                            for s in builder.students[sid]["skills"]:
+                                skill_counts[s] = skill_counts.get(s, 0) + 1
+
+                        missing = [s for s in required_skills if s not in skill_counts]
+                        overlaps = [s for s, c in skill_counts.items() if c > 1]
+                        cov_pct = ((len(required_skills) - len(missing)) / len(required_skills)) * 100
+                        has_conf = any(builder.has_conflict(sid, team) for sid in team)
+
+                        member_badges = ""
+                        for sid in team:
+                            s_obj = builder.students[sid]
+                            skills_str = ", ".join(s_obj["skills"])
+                            days_str = ", ".join(s_obj["availability"])
+                            member_badges += f"<div style='margin:4px 0;'>• <b>{s_obj['name']}</b> (<code>{sid}</code>) — <span class='skill-badge'>{skills_str}</span> <span style='font-size:12px;color:gray;'>({days_str})</span></div>"
+
+                        st.markdown(f"""
+                        <div class="team-card" style="border-left: 6px solid {t_color};">
+                            <h4 style="margin:0 0 8px 0;">Team {t_idx + 1} <span style="float:right;font-size:14px;color:{t_color};">{cov_pct:.0f}% Coverage</span></h4>
+                            {member_badges}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        if has_conf:
+                            st.error("⚠️ Conflict Alert: Team contains members with a -1 Graph edge!")
+                        elif not missing:
+                            st.success("✅ All 4 Core Skills Covered & Conflict-Free")
+                        else:
+                            st.warning(f"⚠️ Missing Skills: {', '.join(missing)}")
+
+                        st.caption(f"**Overlapping Skills:** {', '.join(overlaps) if overlaps else 'None'}")
+                        st.plotly_chart(plot_radar_chart(f"Team {t_idx+1}", skill_counts, required_skills, t_color), use_container_width=True)
+
+            # DSA Inspector at Bottom
+            with st.expander("🔍 Inspect Underlying Data Structures & Execution Logs (DSA Viva Panel)"):
+                tab1, tab2, tab3 = st.tabs(["📜 Draft & Swap Logs (Array)", "🕸️ Adjacency List (Graph)", "🗂️ Registered Profiles (Hash Map)"])
+                with tab1:
+                    st.code("\n".join(builder.logs), language="text")
+                with tab2:
+                    st.json(builder.preference_graph)
+                with tab3:
+                    st.json(builder.students)
