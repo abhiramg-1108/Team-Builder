@@ -15,7 +15,6 @@ DB_FILE = "class_roster.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # registered: 0 = Pending (Uploaded by Prof), 1 = Claimed & Submitted by Student
     c.execute("""
         CREATE TABLE IF NOT EXISTS students (
             sid TEXT PRIMARY KEY,
@@ -26,6 +25,22 @@ def init_db():
             registered INTEGER DEFAULT 0
         )
     """)
+    # Safety check: if an older table existed without the 'registered' column, rebuild it cleanly
+    c.execute("PRAGMA table_info(students)")
+    columns = [col[1] for col in c.fetchall()]
+    if "registered" not in columns:
+        c.execute("DROP TABLE students")
+        c.execute("""
+            CREATE TABLE students (
+                sid TEXT PRIMARY KEY,
+                name TEXT,
+                skills TEXT,
+                interests TEXT,
+                availability TEXT,
+                registered INTEGER DEFAULT 0
+            )
+        """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS edges (
             u TEXT,
@@ -46,7 +61,6 @@ def clear_entire_db():
     conn.close()
 
 def import_master_roster(roster_rows):
-    """Professor uploads (sid, name) list. Resets database to this fresh class roster."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM students")
@@ -59,8 +73,8 @@ def import_master_roster(roster_rows):
     conn.commit()
     conn.close()
 
-def register_student_submission(sid, skills, interests, avail, friend_id="None", avoid_id="None"):
-    """Locks the student's profile (registered = 1) so no one else can select them."""
+def register_student_submission(sid, skills, interests, avail, friend_ids, avoid_ids):
+    """Locks student (registered = 1) and inserts +1 and -1 edges into Graph."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -69,15 +83,17 @@ def register_student_submission(sid, skills, interests, avail, friend_id="None",
            WHERE sid = ? AND registered = 0""",
         (json.dumps(skills), json.dumps(interests), json.dumps(avail), sid)
     )
-    if friend_id != "None" and friend_id != sid:
-        c.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, 1)", (sid, friend_id))
-    if avoid_id != "None" and avoid_id != sid:
-        c.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, -1)", (sid, avoid_id))
+    c.execute("DELETE FROM edges WHERE u = ?", (sid,))
+    for fid in friend_ids:
+        if fid != sid:
+            c.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, 1)", (sid, fid))
+    for aid in avoid_ids:
+        if aid != sid:
+            c.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, -1)", (sid, aid))
     conn.commit()
     conn.close()
 
 def unlock_student_registration(sid):
-    """Allows the professor to reset a single student's submission if they made a mistake."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -144,7 +160,7 @@ class TeamBuilder:
             self.preference_graph[student_id] = {}
 
     def add_preference(self, student_a, student_b, weight):
-        if student_a in self.preference_graph and student_b in self.students:
+        if student_a in self.preference_graph and student_b in self.students and student_a != student_b:
             self.preference_graph[student_a][student_b] = weight
 
     def has_conflict(self, candidate_id, team):
@@ -376,8 +392,16 @@ def plot_radar_chart(team_name, skill_counts, required_skills, color):
 st.set_page_config(page_title="Dynamic Smart Team Builder", layout="wide")
 init_db()
 
+# Ensure the app starts completely empty on a fresh boot until a CSV is uploaded
+if "roster_initialized" not in st.session_state:
+    clear_entire_db()
+    st.session_state.roster_initialized = True
+
 st.markdown("""
 <style>
+.stDeployButton {
+    display: none;
+}
 .team-card {
     padding: 18px;
     border-radius: 12px;
@@ -400,7 +424,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🎯 Classroom Team Formation System")
-st.caption("Workflow: **1. Professor Imports Master Roll-Call CSV** $\\rightarrow$ **2. Students Claim Their Roll No Once & Submit Skills** $\\rightarrow$ **3. Engine Builds Teams & Exports CSV**")
+st.caption("Workflow: **1. Professor Imports Master Roll-Call CSV** $\\rightarrow$ **2. Students Claim Roll No & Select Up to $K-1$ Partners** $\\rightarrow$ **3. Engine Builds Teams & Exports CSV**")
 
 unregistered_list, registered_list, edges_data, all_students_map = fetch_roster_status()
 total_roster_count = len(unregistered_list) + len(registered_list)
@@ -414,7 +438,6 @@ ALL_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 # ==========================================
 st.sidebar.header("📂 Step 1: Master Class Roster")
 
-# Provide a downloadable sample CSV so testing takes 5 seconds
 sample_roster_csv = "roll_no,name\nS101,Aarav Sharma\nS102,Bhavya Nair\nS103,Charan Reddy\nS104,Diya Patel\nS105,Eshan Verma\nS106,Farah Khan\n"
 st.sidebar.download_button(
     "⬇️ Download Sample Roll-Call CSV",
@@ -431,7 +454,6 @@ if uploaded_roster is not None:
         reader = csv.DictReader(content)
         roster_rows = []
         for row in reader:
-            # Support flexible column headers (roll_no / sid / id and name / student_name)
             normalized = {k.strip().lower(): v.strip() for k, v in row.items() if k and v}
             sid = normalized.get("roll_no") or normalized.get("sid") or normalized.get("id")
             name = normalized.get("name") or normalized.get("student_name")
@@ -451,12 +473,11 @@ if total_roster_count > 0:
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Step 3: Algorithm Weights")
-team_sz = st.sidebar.slider("Target Team Size", 2, 5, 3)
+team_sz = st.sidebar.slider("Target Team Size (K)", 2, 5, 3, help="Caps max preferred partners per student to K - 1.")
 skill_w = st.sidebar.slider("Skill Coverage Priority", 0, 100, 60, step=5)
 friend_w = st.sidebar.slider("Friendship Preference (+1 Edge)", 0, 100, 35, step=5)
 sched_w = st.sidebar.slider("Schedule & Interest Match", 0, 100, 20, step=5)
 
-# Allow Professor to unlock a student if someone accidentally submitted wrong info
 if registered_list:
     with st.sidebar.expander("🔓 Admin: Reset a Student's Lock"):
         reg_ids = [sid for sid, _, _, _, _ in registered_list]
@@ -485,18 +506,21 @@ with tab_student:
     elif len(unregistered_list) == 0:
         st.success("🎉 **100% of the class has registered!** All student profiles are locked in. Switch to the **Professor Dashboard** tab to view and export the teams.")
     else:
-        st.write("Select your **Roll Number & Name** from the official class roster below. **Note:** Once you submit, your name will be locked and removed from this list so no one else can submit under your name.")
+        st.write("Select your **Roll Number & Name** below. You **cannot** select yourself as a partner or conflict, and you may choose up to **$K - 1$ Preferred Teammates** based on the current Target Team Size.")
         
         unreg_ids = [sid for sid, _ in unregistered_list]
-        all_roster_ids = list(all_students_map.keys())
+        
+        selected_sid = st.selectbox(
+            "🔒 Select Your Name & Roll Number (Unregistered Students Only) *",
+            unreg_ids,
+            format_func=lambda x: f"{x} — {all_students_map[x]}"
+        )
+        
+        # SET DIFFERENCE: Exclude the student's own ID so they can never pick themselves
+        other_classmates = [sid for sid in all_students_map.keys() if sid != selected_sid]
+        max_partners = max(1, team_sz - 1)
 
         with st.form("locked_student_form", clear_on_submit=True):
-            selected_sid = st.selectbox(
-                "🔒 Select Your Name & Roll Number (Unregistered Students Only) *",
-                unreg_ids,
-                format_func=lambda x: f"{x} — {all_students_map[x]}"
-            )
-            
             c1, c2 = st.columns(2)
             with c1:
                 stu_skills = st.multiselect("Your Technical Skills *", ALL_SKILLS, default=["Frontend"])
@@ -504,29 +528,34 @@ with tab_student:
             with c2:
                 stu_avail = st.multiselect("Your Available Days for Team Meetings *", ALL_DAYS, default=["Mon", "Wed"])
 
-            st.markdown("#### 🤝 Optional: Partner Preferences (From Class Roster)")
+            st.markdown(f"#### 🤝 Confidential Graph Preferences (Max {max_partners} Preferred Partners for Team Size {team_sz})")
             p1, p2 = st.columns(2)
             with p1:
-                pref_friend = st.selectbox(
-                    "💚 Preferred Teammate (+1 Graph Edge)",
-                    ["None"] + all_roster_ids,
-                    format_func=lambda x: f"{x} — {all_students_map[x]}" if x != "None" else "None (No Preference)"
+                pref_friends = st.multiselect(
+                    f"💚 Preferred Teammates (+1 Edges, Max {max_partners})",
+                    other_classmates,
+                    max_selections=max_partners,
+                    format_func=lambda x: f"{x} — {all_students_map[x]}"
                 )
             with p2:
-                pref_avoid = st.selectbox(
-                    "🚫 Conflict / Prefer Not to Work With (-1 Graph Edge)",
-                    ["None"] + all_roster_ids,
-                    format_func=lambda x: f"{x} — {all_students_map[x]}" if x != "None" else "None (No Conflict)"
+                pref_avoids = st.multiselect(
+                    "🚫 Conflicts / Prefer Not to Work With (-1 Edges)",
+                    other_classmates,
+                    format_func=lambda x: f"{x} — {all_students_map[x]}"
                 )
 
             submit_btn = st.form_submit_button("✅ Lock & Submit My Profile", type="primary", use_container_width=True)
             if submit_btn:
+                # SET INTERSECTION CHECK: Prevent choosing the same person in both boxes
+                overlap_peers = set(pref_friends).intersection(set(pref_avoids))
+                
                 if not stu_skills or not stu_avail:
-                    st.error("Please select at least one **Technical Skill** and at least one **Available Day**.")
-                elif pref_friend != "None" and pref_friend == pref_avoid:
-                    st.error("You cannot select the same classmate as both a Preferred Partner and a Conflict!")
+                    st.error("⚠️ Please select at least one **Technical Skill** and at least one **Available Day**.")
+                elif overlap_peers:
+                    overlap_names = [f"{all_students_map[x]} ({x})" for x in overlap_peers]
+                    st.error(f"🚫 **Constraint Violation:** You selected {', '.join(overlap_names)} as BOTH a Preferred Partner and a Conflict! Please remove them from one of the lists.")
                 else:
-                    register_student_submission(selected_sid, stu_skills, stu_interests, stu_avail, pref_friend, pref_avoid)
+                    register_student_submission(selected_sid, stu_skills, stu_interests, stu_avail, pref_friends, pref_avoids)
                     st.success(f"🔒 Profile locked for **{all_students_map[selected_sid]} ({selected_sid})**!")
                     st.rerun()
 
@@ -538,7 +567,6 @@ with tab_prof:
     if total_roster_count == 0:
         st.info("👈 Upload a **Class Roll-Call CSV** (`roll_no, name`) in the left sidebar to initialize your class.")
     else:
-        # Registration Progress Bar & Roster Status Expander
         reg_ratio = len(registered_list) / total_roster_count
         st.progress(reg_ratio, text=f"📋 Class Registration Progress: {len(registered_list)} of {total_roster_count} Students Submitted ({reg_ratio*100:.0f}%)")
         
@@ -566,7 +594,6 @@ with tab_prof:
 
             teams = builder.form_teams()
 
-            # Top Metrics + CSV Export Button
             coverage_scores = []
             total_conflicts = 0
             for team in teams:
@@ -584,7 +611,6 @@ with tab_prof:
             k3.metric("⚖️ Fairness Score", f"{fairness:.1f} / 100")
             k4.metric("🛡️ Conflict Status", "0 Conflicts" if total_conflicts == 0 else f"{total_conflicts} Conflict(s)!", delta="Optimal" if total_conflicts == 0 else "Action Needed", delta_color="normal" if total_conflicts == 0 else "inverse")
 
-            # Generate Export CSV of Final Teams
             export_buffer = io.StringIO()
             writer = csv.writer(export_buffer)
             writer.writerow(["Team_Number", "Roll_No", "Student_Name", "Skills", "Interests", "Available_Days"])
